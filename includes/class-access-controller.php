@@ -1,71 +1,204 @@
 <?php
 defined('ABSPATH') || exit;
 
-/**
- * Class THRIVE_DEV_ACCESS_CONTROLLER
- *
- * Handles admin access restrictions based on IP and user role.
- * Applies DISALLOW_FILE_MODS and logs unauthorized access attempts.
- */
 class THRIVE_DEV_ACCESS_CONTROLLER {
-
     /**
-     * Initialize access control hooks
+     * Initialize access control hooks with proper security measures
      */
     public static function init() {
-        // Run access control as early as possible
-        add_action('admin_init', [self::class, 'enforce'], 1);
+        // Apply access control early but after authentication
+        add_action('init', [self::class, 'enforce'], 1);
+        
+        // Protect AJAX endpoints
+        add_action('admin_init', [self::class, 'protect_ajax']);
+        
+        // Protect REST API endpoints
+        add_filter('rest_authentication_errors', [self::class, 'protect_rest_api']);
     }
 
     /**
-     * Enforce access restrictions for wp-admin.
+     * Core access control enforcement
      */
     public static function enforce() {
-        // Skip for AJAX requests
-        if (defined('DOING_AJAX') && DOING_AJAX) {
-            return;
-        }
-        $remote_config = THRIVE_DEV_CONFIG_MANAGER::get_config();
-        $current_page = THRIVE_DEV_HELPER::get_current_admin_page();
-
-        // Prevent blocking the dashboard itself
-        if ($current_page === 'index.php' || $current_page === 'widget.index.php') {
-            return;
-        }
-
-        // Restrict access to sensitive admin pages
-        if(THRIVE_DEV_HELPER::is_blocked_admin()) {
-            THRIVE_DEV_HELPER::maybe_debug_log('block ' . $current_page);
-            // Check if current page is restricted
-            $is_restricted = in_array($current_page, $remote_config['restricted_pages'] ?? [], true);
-            THRIVE_DEV_HELPER::maybe_debug_log('Current Page ' . $is_restricted);
+        try {
+            // Get config with fallback to secure defaults
+            $config = THRIVE_DEV_CONFIG_MANAGER::get_config();
             
-            if ($is_restricted) {
-                THRIVE_DEV_HELPER::maybe_debug_log('rES ' . $is_restricted);
-                if (class_exists('THRIVE_DEV_LOG_MANAGER')) {
-                    THRIVE_DEV_LOG_MANAGER::log('access-denied', $current_page);
-                }
-                
-                // Redirect with notice
-                THRIVE_DEV_HELPER::display_notice(
-                    sprintf(__('Access denied to %s – for blacklisted administrators.', THRIVE_DEV_TEXT_DOMAIN), $current_page),
-                    'error',
-                    admin_url()
-                );
+            // Always check user capabilities first
+            if (!self::verify_user_access()) {
+                self::handle_access_denied('insufficient_permissions');
+                return;
             }
 
-            // Log access attempt
-            if (isset($_GET['page']) && $_GET['page'] === 'thrive-log') {
-                // Log access denied to the log page
+            // Check IP restrictions
+            if (!self::verify_ip_access($config)) {
+                self::handle_access_denied('ip_restricted');
+                return;
+            }
+
+            // Verify the current page/action is allowed
+            if (!self::verify_page_access($config)) {
+                self::handle_access_denied('page_restricted');
+                return;
+            }
+
+        } catch (Exception $e) {
+            // Log error and fail secure
+            THRIVE_DEV_HELPER::maybe_debug_log('Access control error: ' . $e->getMessage());
+            self::handle_access_denied('system_error');
+        }
+    }
+
+    /**
+     * Verify user has required capabilities
+     */
+    private static function verify_user_access(): bool {
+        if (!is_user_logged_in()) {
+            return false;
+        }
+
+        // Check user capabilities
+        if (!current_user_can('manage_options')) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Verify IP is allowed
+     */
+    private static function verify_ip_access(array $config): bool {
+        $user_ip = THRIVE_DEV_HELPER::get_ip();
+        
+        // IP validation
+        if (!filter_var($user_ip, FILTER_VALIDATE_IP)) {
+            return false;
+        }
+
+        // Check blacklist
+        if (isset($config['blacklist_ips']) && is_array($config['blacklist_ips'])) {
+            if (THRIVE_DEV_HELPER::is_blacklisted($user_ip, $config['blacklist_ips'])) {
                 if (class_exists('THRIVE_DEV_LOG_MANAGER')) {
-                    THRIVE_DEV_LOG_MANAGER::log('log-page-access-denied', 'thrive-log');
+                    THRIVE_DEV_LOG_MANAGER::log('ip_blocked', $user_ip);
                 }
-                THRIVE_DEV_HELPER::display_notice(
-                    __('Access denied to Thrive Block Log  – for blacklisted administrators.', THRIVE_DEV_TEXT_DOMAIN),
-                    'error',
-                    admin_url(),
-                );
+                return false;
             }
         }
+
+        return true;
+    }
+
+    /**
+     * Verify current page access is allowed
+     */
+    private static function verify_page_access(array $config): bool {
+        $current_page = self::get_current_page();
+        
+        // Check if page is restricted
+        if (isset($config['restricted_pages']) && 
+            is_array($config['restricted_pages']) && 
+            in_array($current_page, $config['restricted_pages'], true)) {
+            
+            if (class_exists('THRIVE_DEV_LOG_MANAGER')) {
+                THRIVE_DEV_LOG_MANAGER::log('page_blocked', $current_page);
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Get current page with XSS protection
+     */
+    private static function get_current_page(): string {
+        $page = '';
+        
+        if (isset($_SERVER['PHP_SELF'])) {
+            $page = basename(sanitize_text_field($_SERVER['PHP_SELF']));
+        }
+        
+        if (isset($_GET['page'])) {
+            $page = sanitize_text_field($_GET['page']);
+        }
+
+        return $page;
+    }
+
+    /**
+     * Protect AJAX endpoints
+     */
+    public static function protect_ajax() {
+        if (!defined('DOING_AJAX') || !DOING_AJAX) {
+            return;
+        }
+
+        // Verify nonce for all AJAX requests
+        if (!check_ajax_referer('thrive_ajax_nonce', false, false)) {
+            wp_send_json_error(['message' => 'Invalid security token'], 403);
+            exit;
+        }
+
+        // Apply same access controls to AJAX
+        if (!self::verify_user_access() || 
+            !self::verify_ip_access(THRIVE_DEV_CONFIG_MANAGER::get_config())) {
+            wp_send_json_error(['message' => 'Access denied'], 403);
+            exit;
+        }
+    }
+
+    /**
+     * Protect REST API endpoints
+     */
+    public static function protect_rest_api($errors) {
+        if ($errors) {
+            return $errors;
+        }
+
+        // Apply access controls to REST API
+        if (!self::verify_user_access() || 
+            !self::verify_ip_access(THRIVE_DEV_CONFIG_MANAGER::get_config())) {
+            return new WP_Error(
+                'rest_forbidden',
+                __('Access denied', THRIVE_DEV_TEXT_DOMAIN),
+                ['status' => 403]
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * Handle access denied with proper security headers
+     */
+    private static function handle_access_denied(string $reason) {
+        // Set security headers
+        header('X-Frame-Options: DENY');
+        header('X-Content-Type-Options: nosniff');
+        header('X-XSS-Protection: 1; mode=block');
+        
+        // Log access attempt
+        if (class_exists('THRIVE_DEV_LOG_MANAGER')) {
+            THRIVE_DEV_LOG_MANAGER::log('access_denied', $reason);
+        }
+
+        // Handle based on request type
+        if (defined('DOING_AJAX') && DOING_AJAX) {
+            wp_send_json_error(['message' => 'Access denied'], 403);
+            exit;
+        }
+
+        if (defined('REST_REQUEST') && REST_REQUEST) {
+            wp_send_json_error(['message' => 'Access denied'], 403);
+            exit;
+        }
+
+        // Regular request - show access denied page
+        wp_die(
+            esc_html__('Access Denied', THRIVE_DEV_TEXT_DOMAIN),
+            esc_html__('Access Denied', THRIVE_DEV_TEXT_DOMAIN),
+            ['response' => 403]
+        );
     }
 }
