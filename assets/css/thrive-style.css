@@ -1,0 +1,11 @@
+#thrive-dependencies table {
+    margin-top: 20px;
+}
+
+#thrive-dependencies .button {
+    min-width: 100px;
+}
+
+.toastify {
+    font-size: 14px;
+}
