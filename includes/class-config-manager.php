@@ -1,127 +1,110 @@
 <?php
 defined('ABSPATH') || exit;
 
-/**
- * Class THRIVE_DEV_CONFIG_MANAGER
- *
- * Manages remote configuration including:
- * - Blacklisted IPs
- * - Blocked plugins and themes
- * - Restricted admin pages
- * - Required plugins via TGMPA
- * - Version tracking and fallback
- */
 class THRIVE_DEV_CONFIG_MANAGER {
-    /**
-     * Retrieves and caches the remote config.
-     * Falls back to last known good config on failure.
-     *
-     * @return array
-     */
+    private static $default_config = [
+        'version' => '1.0.0',
+        'restricted_pages' => ['plugins.php', 'themes.php'],
+        'blocked_plugins' => [],
+        'blocked_themes' => [],
+        'blacklist_ips' => [],
+    ];
+
     public static function get_config() {
-        $cached = get_transient(THRIVE_DEV_CONFIG_CACHE_KEY);
-        if ($cached && is_array($cached)) {
-            return $cached;
-        }
-
-        $api_url = THRIVE_DEV_SETTINGS::api_url() ?? '';
-
-        // Basic API config validation
-        if (empty($api_url)) {
-            THRIVE_DEV_HELPER::maybe_debug_log('API URL is missing');
-            THRIVE_DEV_HELPER::display_notice(
-                __('Thrive: Configuration could not be loaded due to missing API URL.', THRIVE_DEV_TEXT_DOMAIN),
-                'error',
-                admin_url(),
-            );
-            return [];
-        }
-
-        if (!filter_var($api_url, FILTER_VALIDATE_URL)) {
-            THRIVE_DEV_HELPER::maybe_debug_log('Invalid API URL: ' . $api_url);
-            THRIVE_DEV_HELPER::maybe_display_notice(
-                __('Thrive: Invalid API URL configured.', THRIVE_DEV_TEXT_DOMAIN),
-                'error',
-                admin_url(),
-            );
-            return [];
-        }
-
-        // Remote request
-        $response = wp_remote_get($api_url, [
-            'timeout'    => apply_filters('thrive_admin_config_timeout', 10),
-            'sslverify'  => true,
-        ]);
-
-        // HTTP and transport error check
-        if (is_wp_error($response)) {
-            THRIVE_DEV_HELPER::maybe_debug_log('API request failed: ' . $response->get_error_message());
-            
-            $fallback = get_option(THRIVE_DEV_CONFIG_FALLBACK_KEY);
-            if (is_array($fallback)) {
-                return $fallback;
+        try {
+            // Try cached config first
+            $cached = get_transient(THRIVE_DEV_CONFIG_CACHE_KEY);
+            if ($cached && is_array($cached)) {
+                return self::validate_config($cached) ? $cached : self::get_fallback_config();
             }
 
-            THRIVE_DEV_HELPER::maybe_display_notice(
-                __('Thrive: Failed to fetch configuration from API.', THRIVE_DEV_TEXT_DOMAIN),
-                'error',
-                admin_url(),
-            );
-            return [];
+            $api_url = THRIVE_DEV_SETTINGS::api_url() ?? '';
+
+            // Basic API config validation
+            if (empty($api_url) || !filter_var($api_url, FILTER_VALIDATE_URL)) {
+                THRIVE_DEV_HELPER::maybe_debug_log('Invalid API URL configuration');
+                return self::get_fallback_config();
+            }
+
+            // Remote request with timeout and error handling
+            $response = wp_remote_get($api_url, [
+                'timeout'    => apply_filters('thrive_admin_config_timeout', 10),
+                'sslverify'  => true,
+            ]);
+
+            if (is_wp_error($response)) {
+                THRIVE_DEV_HELPER::maybe_debug_log('API request failed: ' . $response->get_error_message());
+                return self::get_fallback_config();
+            }
+
+            $http_code = wp_remote_retrieve_response_code($response);
+            if ($http_code !== 200) {
+                THRIVE_DEV_HELPER::maybe_debug_log("API returned non-200 status: $http_code");
+                return self::get_fallback_config();
+            }
+
+            $data = json_decode(wp_remote_retrieve_body($response), true);
+            if (!is_array($data)) {
+                THRIVE_DEV_HELPER::maybe_debug_log('Invalid JSON response from API');
+                return self::get_fallback_config();
+            }
+
+            // Validate and normalize
+            $data = self::validate_config($data) ? 
+                   apply_filters('thrive_admin_filter_remote_config', THRIVE_DEV_HELPER::normalize_config($data)) : 
+                   self::get_fallback_config();
+
+            // Update cache and metadata only if valid
+            if ($data !== self::get_fallback_config()) {
+                $remote_version = $data['version'] ?? '';
+                update_option(THRIVE_DEV_CONFIG_FALLBACK_KEY, $data);
+                update_option(THRIVE_DEV_CONFIG_VERSION_KEY, $remote_version);
+                update_option(THRIVE_DEV_CONFIG_LAST_FETCH_KEY, current_time('mysql'));
+                set_transient(THRIVE_DEV_CONFIG_CACHE_KEY, $data, 60 * MINUTE_IN_SECONDS);
+            }
+
+            return $data;
+
+        } catch (Exception $e) {
+            THRIVE_DEV_HELPER::maybe_debug_log('Config retrieval error: ' . $e->getMessage());
+            return self::get_fallback_config();
         }
-
-        $http_code = wp_remote_retrieve_response_code($response);
-        if ($http_code !== 200) {
-            THRIVE_DEV_HELPER::maybe_debug_log("API returned non-200 status: $http_code");
-            THRIVE_DEV_HELPER::maybe_display_notice(
-                __('Thrive: Invalid response code from API.', THRIVE_DEV_TEXT_DOMAIN),
-                'error',
-                admin_url(),
-            );
-            return [];
-        }
-
-        $data = json_decode(wp_remote_retrieve_body($response), true);
-        if (!is_array($data)) {
-            THRIVE_DEV_HELPER::maybe_debug_log('Invalid JSON response from API');
-            THRIVE_DEV_HELPER::maybe_display_notice(
-                __('Thrive: Invalid API response and no fallback config available.', THRIVE_DEV_TEXT_DOMAIN),
-                'error',
-                admin_url(),
-            );
-            return [];
-        }
-
-        // Validate and normalize
-        $data = apply_filters('thrive_admin_filter_remote_config', THRIVE_DEV_HELPER::normalize_config($data));
-
-        // Warn if empty or missing restricted pages
-        if (empty($data['restricted_pages'])) {
-            THRIVE_DEV_HELPER::maybe_display_notice(
-                __('Thrive: Configuration loaded but no restricted pages defined.', THRIVE_DEV_TEXT_DOMAIN),
-                'warning',
-                admin_url(),
-            );
-            return [];
-        }
-
-        // Update cache, version, fallback
-        $remote_version = $data['version'] ?? '';
-        if ($remote_version !== get_option(THRIVE_DEV_CONFIG_VERSION_KEY)) {
-            update_option(THRIVE_DEV_CONFIG_FALLBACK_KEY, $data);
-            update_option(THRIVE_DEV_CONFIG_VERSION_KEY, $remote_version);
-            update_option(THRIVE_DEV_CONFIG_LAST_FETCH_KEY, current_time('mysql'));
-            set_transient(THRIVE_DEV_CONFIG_CACHE_KEY, $data, 60 * MINUTE_IN_SECONDS);
-        }
-
-        return $data;
     }
 
-    /**
-     * Clears the cache and forces a config refresh.
-     *
-     * @return array The new config
-     */
+    public static function get_fallback_config() {
+        // Try last known good config first
+        $fallback = get_option(THRIVE_DEV_CONFIG_FALLBACK_KEY);
+        if (is_array($fallback) && self::validate_config($fallback)) {
+            return $fallback;
+        }
+
+        // Fall back to default config if no valid stored fallback
+        return self::$default_config;
+    }
+
+    public static function validate_config($config) {
+        if (!is_array($config)) {
+            return false;
+        }
+
+        $required_keys = ['version', 'restricted_pages', 'blocked_plugins', 'blocked_themes', 'blacklist_ips'];
+        foreach ($required_keys as $key) {
+            if (!isset($config[$key])) {
+                return false;
+            }
+        }
+
+        // Validate arrays
+        if (!is_array($config['restricted_pages']) || 
+            !is_array($config['blocked_plugins']) || 
+            !is_array($config['blocked_themes']) || 
+            !is_array($config['blacklist_ips'])) {
+            return false;
+        }
+
+        return true;
+    }
+
     public static function refresh() {
         delete_transient(THRIVE_DEV_CONFIG_CACHE_KEY);
         delete_option(THRIVE_DEV_CONFIG_VERSION_KEY);
