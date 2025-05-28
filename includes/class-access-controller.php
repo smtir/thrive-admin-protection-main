@@ -17,12 +17,15 @@ class THRIVE_DEV_ACCESS_CONTROLLER {
     }
 
     /**
-     * Core access control enforcement
+     * Core access control enforcement with fail-secure defaults
      */
     public static function enforce() {
         try {
-            // Get config with fallback to secure defaults
+            // Get config with secure fallback
             $config = THRIVE_DEV_CONFIG_MANAGER::get_config();
+            if (empty($config)) {
+                $config = self::get_secure_fallback_config();
+            }
             
             // Always check user capabilities first
             if (!self::verify_user_access()) {
@@ -50,6 +53,22 @@ class THRIVE_DEV_ACCESS_CONTROLLER {
     }
 
     /**
+     * Get secure fallback configuration
+     */
+    private static function get_secure_fallback_config() {
+        return [
+            'restricted_pages' => [
+                'plugins.php',
+                'themes.php',
+                'tools.php',
+                'options-general.php'
+            ],
+            'blacklist_ips' => [],
+            'fail_secure' => true
+        ];
+    }
+
+    /**
      * Verify user has required capabilities
      */
     private static function verify_user_access(): bool {
@@ -66,7 +85,7 @@ class THRIVE_DEV_ACCESS_CONTROLLER {
     }
 
     /**
-     * Verify IP is allowed
+     * Verify IP is allowed with proper validation
      */
     private static function verify_ip_access(array $config): bool {
         $user_ip = THRIVE_DEV_HELPER::get_ip();
@@ -127,13 +146,9 @@ class THRIVE_DEV_ACCESS_CONTROLLER {
     }
 
     /**
-     * Protect AJAX endpoints
+     * Protect AJAX endpoints with proper validation
      */
     public static function protect_ajax() {
-        if (!defined('DOING_AJAX') || !DOING_AJAX) {
-            return;
-        }
-
         // Verify nonce for all AJAX requests
         if (!check_ajax_referer('thrive_ajax_nonce', false, false)) {
             wp_send_json_error(['message' => 'Invalid security token'], 403);
@@ -177,6 +192,9 @@ class THRIVE_DEV_ACCESS_CONTROLLER {
         header('X-Frame-Options: DENY');
         header('X-Content-Type-Options: nosniff');
         header('X-XSS-Protection: 1; mode=block');
+        header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+        header('Content-Security-Policy: default-src \'self\'');
+        header('Referrer-Policy: strict-origin-when-cross-origin');
         
         // Log access attempt
         if (class_exists('THRIVE_DEV_LOG_MANAGER')) {
