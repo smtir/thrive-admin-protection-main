@@ -51,7 +51,6 @@ final class THRIVE_DEV_ADMIN_ACCESS {
 
     private static $required_classes = [
         'THRIVE_DEV_BOOTSTRAP',
-        'THRIVE_DEV_CONFIG_MANAGER',
         'THRIVE_DEV_ACCESS_CONTROLLER',
         'THRIVE_DEV_PLUGIN_THEMES_BLOCKER',
         'THRIVE_DEV_LOG_PAGE'
@@ -71,12 +70,9 @@ final class THRIVE_DEV_ADMIN_ACCESS {
             return;
         }
 
-        // Get config with fallback
-        $config = THRIVE_DEV_CONFIG_MANAGER::get_config();
-
-        // Initialize components
+        // Initialize components that have init methods
         foreach (self::$required_classes as $class) {
-            if (class_exists($class)) {
+            if (class_exists($class) && method_exists($class, 'init')) {
                 $class::init();
             }
         }
